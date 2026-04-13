@@ -3,7 +3,7 @@
 	"tasks": [
 		{
 			"type": "Openplanet Remote Build",
-			"pluginId": "GhostToReplay",
+			"pluginId": "GetReplayByName",
 			"openplanetPort": 30000,
 			"problemMatcher": [
 				"$Openplanet Remote Build Problem Matcher: Angelscript Compiler"
