@@ -1,7 +1,9 @@
 [meta]
-name = "GhostToReplay"
-author = "skybaxrider"
+name = "GetReplayByName"
+author = "VellVee"
 category = "Utilities"
-blocks = [ "Plugin_GhostToReplay" ]
-siteid = 62
-version = "1.4.1"
+blocks = [ "Plugin_GetReplayByName" ]
+version = "1.0.0"
+
+[script]
+dependencies = [ "NadeoServices" ]
