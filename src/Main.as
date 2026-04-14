@@ -1,12 +1,22 @@
 bool PermissionChecksPassed = false;
 string inputNickname = "";
 string savedMessage = "";
-bool triggerDownloadNick = false;
-
-// Batch Mode Globals
 string g_batchModeText = "";
 bool g_batchModeRunning = false;
 string g_batchStatus = "";
+
+const string USER_AGENT = "GetReplayByName/1.0.0 by VellVee";
+
+string ScrubFilename(const string &in name) {
+    string scrubbed = name;
+    string[] invalid = {
+        "\\", "/", ":", "*", "?", "\"", "<", ">", "|", "\n", "\r", "\t", "\v", "\f", "\0", "\x08", "$"
+    };
+    for (uint i = 0; i < invalid.Length; i++) {
+        scrubbed = scrubbed.Replace(invalid[i], "_");
+    }
+    return scrubbed;
+}
 
 void RenderMenu()
 {
@@ -20,8 +30,12 @@ void RenderMenu()
             
             if (inputNickname != "") {
                 if (pressedEnter || UI::MenuItem(Icons::Download + " Search and Create Replay")) {
-                    UI::ShowNotification("GetReplayByName", "Starting nickname search for " + inputNickname + "...");
-                    triggerDownloadNick = true;
+                    if (!g_batchModeRunning) {
+                        g_batchModeText = inputNickname;
+                        inputNickname = "";
+                        g_batchModeRunning = true;
+                        startnew(BatchModeExecute);
+                    }
                 }
             }
 
@@ -86,10 +100,10 @@ string GetReplayFilename(CGameGhostScript@ ghost, CGameCtnChallenge@ map)
         error("Error getting replay filename, ghost or map input is null");
         return "";
     }
-    string safeMapName = Text::StripFormatCodes(map.MapName);
-    string safeUserName = ghost.Nickname;
-    string safeCurrTime = Regex::Replace(GetApp().OSLocalDate, "[/ ]", "_");
-    string fmtGhostTime = Time::Format(ghost.Result.Time);
+    string safeMapName = ScrubFilename(Text::StripFormatCodes(map.MapName));
+    string safeUserName = ScrubFilename(Text::StripFormatCodes(ghost.Nickname));
+    string safeCurrTime = Time::FormatString("%Y-%m-%d_%H-%M-%S", Time::Stamp);
+    string fmtGhostTime = ScrubFilename(Time::Format(ghost.Result.Time));
     return safeMapName + "_" + safeUserName + "_" + safeCurrTime + "_(" + fmtGhostTime + ")";
 }
 
@@ -109,28 +123,12 @@ void Main()
     while (!NadeoServices::IsAuthenticated("NadeoServices")) {
         yield();
     }
-
-    while (true)
-    {
-        if (triggerDownloadNick)
-        {
-            if (!g_batchModeRunning) {
-                g_batchModeText = inputNickname;
-                inputNickname = "";
-                g_batchModeRunning = true;
-                startnew(BatchModeExecute);
-            }
-            triggerDownloadNick = false;
-        }
-
-        sleep(1000);
-    }
 }
 
 void BatchModeExecute()
 {
     CTrackMania@ app = cast<CTrackMania>(GetApp());
-    if (app.RootMap is null) {
+    if (app.RootMap is null || app.CurrentPlayground is null) {
         g_batchStatus = "Error: Please play a map to batch-download to first.";
         UI::ShowNotification("GetReplayByName", g_batchStatus, vec4(1.0, 0.0, 0.0, 1.0));
         g_batchModeRunning = false;
@@ -142,28 +140,28 @@ void BatchModeExecute()
     g_batchStatus = "Fetching map UUID from trackmania.io...";
     UI::ShowNotification("GetReplayByName", g_batchStatus);
 
-    Net::HttpRequest@ req2 = Net::HttpRequest();
-    req2.Method = Net::HttpMethod::Get;
-    req2.Url = "https://trackmania.io/api/map/" + mapUid;
-    req2.Headers["User-Agent"] = "GhostToReplayPlugin/1.0 by Antigravity";
-    req2.Start();
-    while(!req2.Finished()) yield();
+    Net::HttpRequest@ mapInfoReq = Net::HttpRequest();
+    mapInfoReq.Method = Net::HttpMethod::Get;
+    mapInfoReq.Url = "https://trackmania.io/api/map/" + mapUid;
+    mapInfoReq.Headers["User-Agent"] = USER_AGENT;
+    mapInfoReq.Start();
+    while(!mapInfoReq.Finished()) yield();
 
-    if (req2.ResponseCode() != 200) {
-        g_batchStatus = "Error: Map translation failed (" + req2.ResponseCode() + ").";
+    if (mapInfoReq.ResponseCode() != 200) {
+        g_batchStatus = "Error: Map translation failed (" + mapInfoReq.ResponseCode() + ").";
         UI::ShowNotification("GetReplayByName", g_batchStatus, vec4(1.0, 0.0, 0.0, 1.0));
         g_batchModeRunning = false;
         return;
     }
     
-    Json::Value res2 = Json::Parse(req2.String());
-    if (!res2.HasKey("mapId")) {
+    Json::Value mapInfoRes = Json::Parse(mapInfoReq.String());
+    if (mapInfoRes.GetType() == Json::Type::Null || !mapInfoRes.HasKey("mapId")) {
         g_batchStatus = "Error: Could not retrieve map UUID.";
         UI::ShowNotification("GetReplayByName", g_batchStatus, vec4(1.0, 0.0, 0.0, 1.0));
         g_batchModeRunning = false;
         return;
     }
-    string mapId = string(res2["mapId"]);
+    string mapId = string(mapInfoRes["mapId"]);
 
     string[] parsedNicknames;
     string[] lines = g_batchModeText.Split("\n");
@@ -192,7 +190,13 @@ void BatchModeExecute()
     }
     UI::ShowNotification("GetReplayByName", g_batchStatus);
 
+    uint successCount = 0;
     for (uint i = 0; i < parsedNicknames.Length; i++) {
+        if (app.RootMap is null) {
+            UI::ShowNotification("GetReplayByName", "Map exited! Download aborted.", vec4(1.0, 0.0, 0.0, 1.0));
+            break;
+        }
+
         string nick = parsedNicknames[i];
         
         if (parsedNicknames.Length > 1) {
@@ -202,90 +206,127 @@ void BatchModeExecute()
             g_batchStatus = "Processing: " + nick;
         }
         
-        DownloadGhostForNicknameInternal(nick, mapId, app.RootMap);
+        if (DownloadGhostForNicknameInternal(nick, mapId, app.RootMap)) {
+            successCount++;
+        }
         
         if (i < parsedNicknames.Length - 1) {
             sleep(1000);
         }
     }
     
-    g_batchStatus = "All replays saved!";
-    UI::ShowNotification("GetReplayByName", g_batchStatus, vec4(0.0, 1.0, 0.0, 1.0));
+    if (successCount > 0) {
+        g_batchStatus = "Saved " + successCount + "/" + parsedNicknames.Length + " replays!";
+        UI::ShowNotification("GetReplayByName", g_batchStatus, vec4(0.0, 1.0, 0.0, 1.0));
+    } else {
+        g_batchStatus = "Error: No replays could be saved.";
+        UI::ShowNotification("GetReplayByName", g_batchStatus, vec4(1.0, 0.0, 0.0, 1.0));
+    }
     g_batchModeText = "";
     g_batchModeRunning = false;
 }
 
-void DownloadGhostForNicknameInternal(const string &in nickname, const string &in mapId, CGameCtnChallenge@ map)
+bool DownloadGhostForNicknameInternal(const string &in nickname, const string &in mapId, CGameCtnChallenge@ map)
 {
     print("Searching trackmania.io for '" + nickname + "'...");
-    Net::HttpRequest@ req1 = Net::HttpRequest();
-    req1.Method = Net::HttpMethod::Get;
-    req1.Url = "https://trackmania.io/api/players/find?search=" + Net::UrlEncode(nickname);
-    req1.Headers["User-Agent"] = "GhostToReplayPlugin/1.0 by Antigravity";
-    req1.Start();
-    while(!req1.Finished()) yield();
+    Net::HttpRequest@ searchReq = Net::HttpRequest();
+    searchReq.Method = Net::HttpMethod::Get;
+    searchReq.Url = "https://trackmania.io/api/players/find?search=" + Net::UrlEncode(nickname);
+    searchReq.Headers["User-Agent"] = USER_AGENT;
+    searchReq.Start();
+    while(!searchReq.Finished()) yield();
 
-    if (req1.ResponseCode() != 200) {
-        print("Error: TM.io search failed for " + nickname);
-        return;
+    if (searchReq.ResponseCode() != 200) {
+        warn("TM.io search failed for " + nickname + " (" + searchReq.ResponseCode() + ")");
+        return false;
     }
 
-    Json::Value res1 = Json::Parse(req1.String());
-    if (res1.GetType() != Json::Type::Array || res1.Length == 0) {
-        print("Error: Player not found on Trackmania.io: " + nickname);
-        return;
+    if (searchReq.String().Length == 0) {
+        warn("Received empty response from Trackmania.io for " + nickname);
+        return false;
     }
-    string accountId = string(res1[0]["player"]["id"]);
-    string actualName = string(res1[0]["player"]["name"]);
-    print("Found player " + actualName + ", fetching map definitions...");
+
+    Json::Value searchRes = Json::Parse(searchReq.String());
+    if (searchRes.GetType() != Json::Type::Array || searchRes.Length == 0) {
+        warn("Player not found on Trackmania.io: " + nickname);
+        return false;
+    }
+
+    Json::Value firstResult = searchRes[0];
+    if (firstResult.GetType() != Json::Type::Object || !firstResult.HasKey("player")) {
+        warn("Unexpected API response shape for: " + nickname);
+        return false;
+    }
+    Json::Value playerObj = firstResult["player"];
+    if (playerObj.GetType() != Json::Type::Object || !playerObj.HasKey("id") || !playerObj.HasKey("name")) {
+        warn("Player object missing required fields for: " + nickname);
+        return false;
+    }
+
+    string accountId = string(playerObj["id"]);
+    string actualName = string(playerObj["name"]);
+    print("Found player " + actualName + ", fetching map records...");
     
-    print("Fetching map records for player...");
-    string url3 = NadeoServices::BaseURLCore() + "/mapRecords/?accountIdList=" + accountId + "&mapIdList=" + mapId;
-    auto req3 = NadeoServices::Get("NadeoServices", url3);
-    req3.Start();
-    while(!req3.Finished()) yield();
+    string recordUrl = NadeoServices::BaseURLCore() + "/mapRecords/?accountIdList=" + accountId + "&mapIdList=" + mapId;
+    auto recordReq = NadeoServices::Get("NadeoServices", recordUrl);
+    recordReq.Start();
+    while(!recordReq.Finished()) yield();
     
-    if (req3.ResponseCode() != 200) {
-        print("Error: Failed to fetch record from NadeoServices for " + actualName + " (" + req3.ResponseCode() + ")");
-        return;
+    if (recordReq.ResponseCode() != 200) {
+        warn("Failed to fetch record from NadeoServices for " + actualName + " (" + recordReq.ResponseCode() + ")");
+        return false;
     }
 
-    Json::Value res3 = Json::Parse(req3.String());
-    if (res3.GetType() != Json::Type::Array || res3.Length == 0) {
-        print("Error: " + actualName + " has no record on this map.");
-        return;
+    Json::Value recordRes = Json::Parse(recordReq.String());
+    if (recordRes.GetType() != Json::Type::Array || recordRes.Length == 0) {
+        warn(actualName + " has no record on this map.");
+        return false;
     }
 
-    string mapRecordId = string(res3[0]["mapRecordId"]);
+    Json::Value firstRecord = recordRes[0];
+    if (firstRecord.GetType() != Json::Type::Object || !firstRecord.HasKey("mapRecordId")) {
+        warn("Record response missing mapRecordId for " + actualName);
+        return false;
+    }
+
+    string mapRecordId = string(firstRecord["mapRecordId"]);
     string ghostUrl = "https://prod.trackmania.core.nadeo.online/mapRecords/" + mapRecordId + "/replay";
     
-    // Always append noise suffix to skirt Nadeo's aggressive ghost URL cache mechanisms 
-    ghostUrl += "#" + Crypto::RandomBase64(12, url: true);
+    // Append cache-bust query parameter to bypass Nadeo's aggressive ghost URL caching
+    ghostUrl += "?cb=" + Crypto::RandomBase64(12);
     
     print("Downloading ghost from core services...");
     auto dataFileMgr = TryGetDataFileMgr();
     if (dataFileMgr is null) {
-        print("Error: Could not get DataFileMgr to download " + actualName);
-        return;
+        warn("Could not get DataFileMgr to download " + actualName);
+        return false;
     }
 
     auto ghostTask = dataFileMgr.Ghost_Download("", ghostUrl);
     uint timeout = 20000;
-    uint currentTime = 0;
-    while(ghostTask.Ghost is null && currentTime < timeout) {
-        currentTime += 100;
+    uint elapsed = 0;
+    while(ghostTask.Ghost is null && !ghostTask.HasFailed && elapsed < timeout) {
+        elapsed += 100;
+        if (elapsed % 5000 == 0) {
+            print("Still downloading ghost for " + actualName + "... (" + (elapsed / 1000) + "s)");
+        }
         sleep(100);
     }
     
     CGameGhostScript@ ghost = cast<CGameGhostScript>(ghostTask.Ghost);
-    if (ghost !is null) {
-        string replayName = GetReplayFilename(ghost, map);
-        string replayPath = "Downloaded/" + replayName;
-        dataFileMgr.Replay_Save(replayPath, map, ghost);
-        print("Saved replay to: " + replayPath + ".Replay.Gbx");
-    } else {
-        print("Error: Ghost download failed or timed out for " + actualName);
+    if (ghost is null) {
+        warn("Ghost download failed or timed out for " + actualName);
+        return false;
     }
+
+    if (map is null) {
+        warn("Map was unloaded during download for " + actualName);
+        return false;
+    }
+
+    string replayName = GetReplayFilename(ghost, map);
+    string replayPath = "Downloaded/" + replayName;
+    dataFileMgr.Replay_Save(replayPath, map, ghost);
+    print("Saved replay to: " + replayPath + ".Replay.Gbx");
+    return true;
 }
-
-
